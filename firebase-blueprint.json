@@ -1,0 +1,30 @@
+{
+  "entities": {
+    "store": {
+      "description": "Global store singleton document containing catalog products, blogs, shipping info, about content, announcement, and promo codes",
+      "properties": {
+        "productsEn": { "type": "array" },
+        "productsFr": { "type": "array" },
+        "blogsEn": { "type": "array" },
+        "blogsFr": { "type": "array" },
+        "shippingEn": { "type": "array" },
+        "shippingFr": { "type": "array" },
+        "aboutEn": { "type": "array" },
+        "aboutFr": { "type": "array" },
+        "announcement": { "type": "object" },
+        "giftCodes": { "type": "array" },
+        "newsletters": { "type": "array" }
+      }
+    },
+    "orders": {
+      "description": "Customer orders collection",
+      "properties": {
+        "id": { "type": "string" },
+        "customerName": { "type": "string" },
+        "customerEmail": { "type": "string" },
+        "total": { "type": "number" },
+        "paymentStatus": { "type": "string" }
+      }
+    }
+  }
+}
