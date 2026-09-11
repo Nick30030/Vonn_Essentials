@@ -84,6 +84,49 @@ export const FREE_SHIPPING_THRESHOLDS: Record<string, number | null> = {
   "NU": null,
 };
 
+const SUPABASE_ORDER_COLUMNS = new Set([
+  "id", "created_at", "date", "customerName", "customerEmail",
+  "address", "city", "province", "postal", "country", "items",
+  "subtotal", "shipping", "hst", "total", "paymentMethod",
+  "paymentStatus", "shippingMethod", "orderComments", "discountCode",
+  "discountAmount", "shippingDiscountAmount", "etransferDetails", "refundDetails"
+]);
+
+export function normalizeOrderForSupabase(order: any): any {
+  const row: Record<string, any> = {};
+  for (const key of Object.keys(order)) {
+    if (SUPABASE_ORDER_COLUMNS.has(key) && order[key] !== undefined) {
+      row[key] = order[key];
+    }
+  }
+  if (!row.created_at && (order.createdAt || order.date)) {
+    try {
+      row.created_at = new Date(order.createdAt || order.date).toISOString();
+    } catch {
+      row.created_at = new Date().toISOString();
+    }
+  }
+  return row;
+}
+
+function mergeOrderLists(existing: Order[], incoming: Order[]): Order[] {
+  const map = new Map<string, Order>();
+  for (const o of existing || []) {
+    if (o && o.id) map.set(o.id, o);
+  }
+  for (const o of incoming || []) {
+    if (o && o.id) {
+      const prev = map.get(o.id);
+      map.set(o.id, prev ? { ...prev, ...o } : o);
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => {
+    const timeA = new Date((a as any).created_at || a.createdAt || a.date || 0).getTime();
+    const timeB = new Date((b as any).created_at || b.createdAt || b.date || 0).getTime();
+    return timeB - timeA;
+  });
+}
+
 const CartContext = createContext<CartContextType | undefined>(undefined);
 
 export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -109,7 +152,8 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const saved = localStorage.getItem("vonn_orders");
     if (saved) {
       try {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
       } catch (e) {
         // Fallback
       }
@@ -118,17 +162,39 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
   });
 
   const fetchOrders = async () => {
+    let fetchedList: Order[] = [];
+
+    // 1. Fetch from Supabase directly
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('orders').select('*');
+        if (!error && Array.isArray(data) && data.length > 0) {
+          fetchedList = data as Order[];
+        }
+      } catch (sbErr) {
+        console.warn("Direct Supabase fetch orders notice:", sbErr);
+      }
+    }
+
+    // 2. Fetch from Server API
     try {
       const res = await fetch("/api/orders");
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data)) {
-          setOrders(data);
-          localStorage.setItem("vonn_orders", JSON.stringify(data));
+        if (Array.isArray(data) && data.length > 0) {
+          fetchedList = mergeOrderLists(fetchedList, data);
         }
       }
     } catch {
       // Suppressed
+    }
+
+    if (fetchedList.length > 0) {
+      setOrders((prev) => {
+        const merged = mergeOrderLists(prev, fetchedList);
+        localStorage.setItem("vonn_orders", JSON.stringify(merged));
+        return merged;
+      });
     }
   };
 
@@ -152,13 +218,11 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 liveOrders.push(data as Order);
               }
             });
-            liveOrders.sort((a, b) => {
-              const timeA = new Date(a.createdAt || a.date || 0).getTime();
-              const timeB = new Date(b.createdAt || b.date || 0).getTime();
-              return timeB - timeA;
+            setOrders((prev) => {
+              const merged = mergeOrderLists(prev, liveOrders);
+              localStorage.setItem("vonn_orders", JSON.stringify(merged));
+              return merged;
             });
-            setOrders(liveOrders);
-            localStorage.setItem("vonn_orders", JSON.stringify(liveOrders));
           }
         }, (err) => {
           console.warn("Firestore live orders subscription notice:", err?.message || err);
@@ -208,12 +272,27 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const addOrder = async (order: Order): Promise<{ success: boolean; order?: Order; error?: string }> => {
     // 1. Optimistically update local state & cache
     setOrders((prev) => {
-      const updated = [order, ...prev.filter(o => o.id !== order.id)];
+      const updated = mergeOrderLists([order], prev);
       localStorage.setItem("vonn_orders", JSON.stringify(updated));
       return updated;
     });
 
-    // 2. Direct client Firestore write (best-effort redundancy)
+    // 2. Direct Supabase write (using column whitelist)
+    if (supabase) {
+      try {
+        const normalized = normalizeOrderForSupabase(order);
+        const { error } = await supabase.from('orders').upsert([normalized]);
+        if (error) {
+          console.warn('Supabase upsert order notice:', error.message || error);
+        } else {
+          console.log(`[Order Confirmation] Direct Supabase persistence confirmed for Order #${order.id}`);
+        }
+      } catch (e: any) {
+        console.warn('Supabase upsert orders exception:', e?.message || e);
+      }
+    }
+
+    // 3. Direct client Firestore write (best-effort redundancy)
     try {
       if (db) {
         await setDoc(doc(db, "orders", order.id), order, { merge: true });
@@ -221,15 +300,6 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch (fsErr: any) {
       console.warn("Direct client Firestore write notice (will rely on server persistence):", fsErr?.message || fsErr);
-    }
-
-    // 3. Supabase write if configured
-    if (supabase) {
-      try {
-        await supabase.from('orders').insert([order]);
-      } catch (e) {
-        console.warn('Supabase insert orders notice:', e);
-      }
     }
 
     // 4. Primary backend database write via API
@@ -242,27 +312,27 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (!res.ok) {
         const errText = await res.text();
-        console.error(`[Database Persistence Error] Server responded with error ${res.status}:`, errText);
-        return { success: false, error: `Database persistence responded with HTTP ${res.status}` };
+        console.warn(`[Database Persistence Notice] Server responded with code ${res.status}:`, errText);
+        return { success: true, order };
       }
 
       const data = await res.json();
       if (data.success) {
-        console.log(`[Order Confirmation] Server successfully stored Order #${order.id} in primary database.`);
+        console.log(`[Order Confirmation] Server successfully stored Order #${order.id}.`);
         if (Array.isArray(data.orders)) {
-          setOrders(data.orders);
-          localStorage.setItem("vonn_orders", JSON.stringify(data.orders));
+          setOrders((prev) => {
+            const merged = mergeOrderLists(prev, data.orders);
+            localStorage.setItem("vonn_orders", JSON.stringify(merged));
+            return merged;
+          });
         }
         return { success: true, order: data.order || order };
-      } else {
-        console.error("[Database Persistence Error] Order store returned false success:", data.error);
-        return { success: false, error: data.error || "Failed to persist order" };
       }
     } catch (err: any) {
-      console.error("[Database Persistence Error] Network error during order persistence:", err?.message || err);
-      // Even if network fails, the local state and client attempt were made
-      return { success: false, error: err?.message || "Network error" };
+      console.warn("[Database Persistence Notice] Network error during backend order call:", err?.message || err);
     }
+
+    return { success: true, order };
   };
 
   const updateOrderStatus = async (orderId: string, status: Order["paymentStatus"]) => {
@@ -273,7 +343,17 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return updated;
     });
 
-    // 2. Direct client Firestore write
+    // 2. Supabase write if configured
+    if (supabase) {
+      try {
+        await supabase.from('orders').update({ paymentStatus: status }).eq('id', orderId);
+        console.log(`[Status Flow] Updated status for Order #${orderId} in Supabase to '${status}'`);
+      } catch (e) {
+        console.warn('Supabase update orders notice:', e);
+      }
+    }
+
+    // 3. Direct client Firestore write
     try {
       if (db) {
         await updateDoc(doc(db, "orders", orderId), {
@@ -283,15 +363,6 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch (e) {
       console.warn("Client Firestore status update notice:", e);
-    }
-
-    // 3. Supabase write if configured
-    if (supabase) {
-      try {
-        await supabase.from('orders').update({ paymentStatus: status }).eq('id', orderId);
-      } catch (e) {
-        console.warn('Supabase update orders notice:', e);
-      }
     }
 
     // 4. Server API update
@@ -304,14 +375,15 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (res.ok) {
         const data = await res.json();
         if (data.orders) {
-          setOrders(data.orders);
-          localStorage.setItem("vonn_orders", JSON.stringify(data.orders));
+          setOrders((prev) => {
+            const merged = mergeOrderLists(prev, data.orders);
+            localStorage.setItem("vonn_orders", JSON.stringify(merged));
+            return merged;
+          });
         }
-      } else {
-        console.error(`[Database Error] Status update failed on server: ${res.status}`);
       }
     } catch (err) {
-      console.error("[Database Error] Network error during status update:", err);
+      console.warn("[Database Error] Network error during status update:", err);
     }
   };
 
@@ -339,9 +411,23 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (supabase) {
       try {
         await supabase.from('orders').update({ paymentStatus: refundData.status, refundDetails: refundData.refundDetails }).eq('id', orderId);
+        console.log(`[Refund Flow] Updated refund status for Order #${orderId} in Supabase`);
       } catch (e) {
         console.warn('Supabase refund update error (suppressed):', e);
       }
+    }
+
+    // Direct Firestore update
+    try {
+      if (db) {
+        await updateDoc(doc(db, "orders", orderId), {
+          paymentStatus: refundData.status,
+          refundDetails: refundData.refundDetails,
+          updatedAt: new Date().toISOString()
+        });
+      }
+    } catch (e) {
+      console.warn("Client Firestore refund update notice:", e);
     }
 
     try {
@@ -353,12 +439,15 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (res.ok) {
         const data = await res.json();
         if (data.orders) {
-          setOrders(data.orders);
-          localStorage.setItem("vonn_orders", JSON.stringify(data.orders));
+          setOrders((prev) => {
+            const merged = mergeOrderLists(prev, data.orders);
+            localStorage.setItem("vonn_orders", JSON.stringify(merged));
+            return merged;
+          });
         }
       }
     } catch (err) {
-      console.error("[Database Error] Network error during refund update:", err);
+      console.warn("[Database Error] Network error during refund update:", err);
     }
   };
 

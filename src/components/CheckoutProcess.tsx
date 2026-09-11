@@ -492,7 +492,6 @@ export default function CheckoutProcess({ isOpen, onClose }: { isOpen: boolean, 
 
     const saved = localStorage.getItem("vonn_gift_codes");
     let codesList: any[] = [
-      { code: "WELCOME25", discountType: "product_percentage", discountValue: 25, description: "25% discount on products" },
       { code: "SAVE50", discountType: "product_percentage", discountValue: 50, description: "50% discount on products" },
       { code: "FREESHIP", discountType: "shipping_free", discountValue: 100, description: "100% free shipping" },
       { code: "HALFSHIP", discountType: "shipping_percentage", discountValue: 50, description: "50% off shipping" }
@@ -914,7 +913,7 @@ export default function CheckoutProcess({ isOpen, onClose }: { isOpen: boolean, 
                       setPromoCodeInput(e.target.value);
                       setPromoError("");
                     }}
-                    placeholder={language === "en" ? "e.g. WELCOME25" : "ex: WELCOME25"}
+                    placeholder={language === "en" ? "e.g. SAVE50" : "ex: SAVE50"}
                     className="flex-1 p-2.5 border border-gray-300 rounded-xl text-xs uppercase font-sans focus:outline-none focus:ring-1 focus:ring-brand-accent focus:border-brand-accent bg-white"
                   />
                   <button
@@ -1027,7 +1026,7 @@ export default function CheckoutProcess({ isOpen, onClose }: { isOpen: boolean, 
                           setPromoCodeInput(e.target.value);
                           setPromoError("");
                         }}
-                        placeholder={language === "en" ? "e.g. WELCOME25" : "ex: WELCOME25"}
+                        placeholder={language === "en" ? "e.g. SAVE50" : "ex: SAVE50"}
                         className="flex-1 p-2 border border-gray-300 rounded-xl text-xs uppercase font-sans focus:outline-none focus:ring-1 focus:ring-brand-accent focus:border-brand-accent bg-white"
                       />
                       <button

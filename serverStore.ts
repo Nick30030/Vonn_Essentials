@@ -367,7 +367,6 @@ const DEFAULT_BLOG_FR = [
 ];
 
 const DEFAULT_GIFT_CODES: GiftCode[] = [
-  { code: "WELCOME25", discountType: "product_percentage", discountValue: 25, description: "25% discount on products" },
   { code: "SAVE50", discountType: "product_percentage", discountValue: 50, description: "50% discount on products" },
   { code: "FREESHIP", discountType: "shipping_free", discountValue: 100, description: "100% free shipping" },
   { code: "HALFSHIP", discountType: "shipping_percentage", discountValue: 50, description: "50% off shipping" }

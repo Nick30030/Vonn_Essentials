@@ -12,6 +12,107 @@ import { getAuth, signInAnonymously } from "firebase/auth";
 import { getFirestore, doc, setDoc as firestoreSetDoc, collection, getDocs } from "firebase/firestore";
 import nodemailer from "nodemailer";
 import { getStore, saveStore } from "./serverStore";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+
+const defaultSupabaseUrl = 'https://dboukhnrngfocekeqaua.supabase.co';
+const defaultSupabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRib3VraG5ybmdmb2Nla2VxYXVhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg1NDEwNjIsImV4cCI6MjEwNDExNzA2Mn0.CFGZWO72h1t8WKR4-j1J4A7lAfQTIhGdWiHLdNUJKrA';
+
+const serverSupabaseUrl =
+  process.env.SUPABASE_URL ||
+  process.env.VITE_SUPABASE_URL ||
+  process.env.NEXT_PUBLIC_SUPABASE_URL ||
+  defaultSupabaseUrl;
+
+const serverSupabaseKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.VITE_SUPABASE_ANON_KEY ||
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+  defaultSupabaseAnonKey;
+
+let serverSupabase: any = null;
+try {
+  serverSupabase = createSupabaseClient(serverSupabaseUrl, serverSupabaseKey);
+} catch (sbInitErr) {
+  console.warn("Server Supabase initialization notice:", sbInitErr);
+}
+
+const SUPABASE_ORDER_COLUMNS = new Set([
+  "id", "created_at", "date", "customerName", "customerEmail",
+  "address", "city", "province", "postal", "country", "items",
+  "subtotal", "shipping", "hst", "total", "paymentMethod",
+  "paymentStatus", "shippingMethod", "orderComments", "discountCode",
+  "discountAmount", "shippingDiscountAmount", "etransferDetails", "refundDetails"
+]);
+
+function normalizeOrderForSupabase(order: any): any {
+  const row: Record<string, any> = {};
+  for (const key of Object.keys(order)) {
+    if (SUPABASE_ORDER_COLUMNS.has(key) && order[key] !== undefined) {
+      row[key] = order[key];
+    }
+  }
+  if (!row.created_at && (order.createdAt || order.date)) {
+    try {
+      row.created_at = new Date(order.createdAt || order.date).toISOString();
+    } catch {
+      row.created_at = new Date().toISOString();
+    }
+  }
+  return row;
+}
+
+async function saveOrderToSupabase(order: any): Promise<boolean> {
+  try {
+    if (!serverSupabase) return false;
+    const normalized = normalizeOrderForSupabase(order);
+    const { error } = await serverSupabase.from("orders").upsert([normalized]);
+    if (error) {
+      console.warn("[Supabase Server Notice] Order upsert notice:", error.message || error);
+      return false;
+    }
+    console.log(`[Supabase Server] Persisted Order #${order.id} to Supabase orders table.`);
+    return true;
+  } catch (err: any) {
+    console.warn("[Supabase Server Notice] Order upsert exception:", err?.message || err);
+    return false;
+  }
+}
+
+async function getOrdersFromSupabase(): Promise<any[] | null> {
+  try {
+    if (!serverSupabase) return null;
+    const { data, error } = await serverSupabase.from("orders").select("*");
+    if (error) {
+      console.warn("[Supabase Server Notice] Orders fetch notice:", error.message || error);
+      return null;
+    }
+    return data || [];
+  } catch (err: any) {
+    console.warn("[Supabase Server Notice] Orders fetch exception:", err?.message || err);
+    return null;
+  }
+}
+
+async function updateOrderStatusInSupabase(orderId: string, status: string, extraData: any = {}): Promise<boolean> {
+  try {
+    if (!serverSupabase) return false;
+    const payload: any = { paymentStatus: status };
+    if (extraData.refundDetails) {
+      payload.refundDetails = extraData.refundDetails;
+    }
+    const { error } = await serverSupabase.from("orders").update(payload).eq("id", orderId);
+    if (error) {
+      console.warn(`[Supabase Server Notice] Status update notice for Order #${orderId}:`, error.message || error);
+      return false;
+    }
+    console.log(`[Supabase Server] Updated Order #${orderId} status to '${status}' in Supabase.`);
+    return true;
+  } catch (err: any) {
+    console.warn(`[Supabase Server Notice] Status update exception for Order #${orderId}:`, err?.message || err);
+    return false;
+  }
+}
 
 // Create express app at module scope so it can be exported for serverless bundling
 const app = express();
@@ -485,27 +586,50 @@ async function startServer() {
   app.get("/api/orders", async (req, res) => {
     try {
       const store = getStore();
-      // Try to fetch from primary Firestore database
-      const firestoreOrders = await getOrdersFromFirestore();
-      if (firestoreOrders && firestoreOrders.length > 0) {
-        // Merge Firestore orders with store orders (deduplicating by id)
-        const orderMap = new Map<string, any>();
-        for (const o of store.orders || []) {
-          if (o && o.id) orderMap.set(o.id, o);
-        }
-        for (const o of firestoreOrders) {
-          if (o && o.id) orderMap.set(o.id, { ...orderMap.get(o.id), ...o });
-        }
-        const merged = Array.from(orderMap.values()).sort((a, b) => {
-          const timeA = new Date(a.createdAt || a.date || 0).getTime();
-          const timeB = new Date(b.createdAt || b.date || 0).getTime();
-          return timeB - timeA;
-        });
-        store.orders = merged;
-        saveStore(store);
-        return res.json(merged);
+      const orderMap = new Map<string, any>();
+      for (const o of store.orders || []) {
+        if (o && o.id) orderMap.set(o.id, o);
       }
-      res.json(store.orders || []);
+
+      // 1. Fetch from Supabase database
+      try {
+        const supabaseOrders = await getOrdersFromSupabase();
+        if (supabaseOrders && supabaseOrders.length > 0) {
+          for (const o of supabaseOrders) {
+            if (o && o.id) {
+              const existing = orderMap.get(o.id);
+              orderMap.set(o.id, existing ? { ...existing, ...o } : o);
+            }
+          }
+        }
+      } catch (sbErr: any) {
+        console.warn("[Database Error] Supabase orders fetch notice:", sbErr?.message || sbErr);
+      }
+
+      // 2. Fetch from Firestore database
+      try {
+        const firestoreOrders = await getOrdersFromFirestore();
+        if (firestoreOrders && firestoreOrders.length > 0) {
+          for (const o of firestoreOrders) {
+            if (o && o.id) {
+              const existing = orderMap.get(o.id);
+              orderMap.set(o.id, existing ? { ...existing, ...o } : o);
+            }
+          }
+        }
+      } catch (fsErr: any) {
+        console.warn("[Database Error] Firestore orders fetch notice:", fsErr?.message || fsErr);
+      }
+
+      const merged = Array.from(orderMap.values()).sort((a, b) => {
+        const timeA = new Date(a.created_at || a.createdAt || a.date || 0).getTime();
+        const timeB = new Date(b.created_at || b.createdAt || b.date || 0).getTime();
+        return timeB - timeA;
+      });
+
+      store.orders = merged;
+      saveStore(store);
+      return res.json(merged);
     } catch (e: any) {
       console.error("[Database Error] Error fetching orders:", e?.message || e);
       try {
@@ -524,15 +648,23 @@ async function startServer() {
         return res.status(400).json({ success: false, error: "Invalid order data: id is required" });
       }
 
-      // 1. Immediately persist to primary database (Firestore) independent of email notifications
+      // 1. Persist to Supabase database
+      let supabaseSaved = false;
+      try {
+        supabaseSaved = await saveOrderToSupabase(order);
+      } catch (sbErr: any) {
+        console.error("[Database Error] Supabase write error during order creation:", sbErr?.message || sbErr);
+      }
+
+      // 2. Persist to Firestore database
       let firestoreSaved = false;
       try {
         firestoreSaved = await saveOrderToFirestore(order);
       } catch (dbErr: any) {
-        console.error("[Database Error] Primary write error during order creation:", dbErr?.message || dbErr);
+        console.error("[Database Error] Firestore write error during order creation:", dbErr?.message || dbErr);
       }
 
-      // 2. Also persist to local file store (serverStore) for reliability
+      // 3. Persist to local file store (serverStore)
       const store = getStore();
       const existingIdx = store.orders.findIndex((o: any) => o.id === order.id);
       if (existingIdx >= 0) {
@@ -548,7 +680,8 @@ async function startServer() {
         success: true,
         order,
         orders: store.orders,
-        databasePersisted: firestoreSaved
+        supabasePersisted: supabaseSaved,
+        databasePersisted: firestoreSaved || supabaseSaved
       });
     } catch (e: any) {
       console.error("[Database Error] Critical failure handling POST /api/orders:", e?.message || e);
@@ -564,14 +697,21 @@ async function startServer() {
         return res.status(400).json({ success: false, error: "paymentStatus is required" });
       }
 
-      // 1. Update in Firestore
+      // 1. Update in Supabase
+      try {
+        await updateOrderStatusInSupabase(id, paymentStatus);
+      } catch (sbErr: any) {
+        console.error(`[Database Error] Status update failed in Supabase for Order #${id}:`, sbErr?.message || sbErr);
+      }
+
+      // 2. Update in Firestore
       try {
         await updateOrderStatusInFirestore(id, paymentStatus);
       } catch (dbErr: any) {
         console.error(`[Database Error] Status update failed in Firestore for Order #${id}:`, dbErr?.message || dbErr);
       }
 
-      // 2. Update in local store
+      // 3. Update in local store
       const store = getStore();
       store.orders = store.orders.map((o: any) => o.id === id ? { ...o, paymentStatus } : o);
       saveStore(store);
@@ -595,14 +735,21 @@ async function startServer() {
         status: "processing"
       };
 
-      // 1. Update in Firestore
+      // 1. Update in Supabase
+      try {
+        await updateOrderStatusInSupabase(id, targetStatus, { refundDetails: targetRefundDetails });
+      } catch (sbErr: any) {
+        console.error(`[Database Error] Refund status update failed in Supabase for Order #${id}:`, sbErr?.message || sbErr);
+      }
+
+      // 2. Update in Firestore
       try {
         await updateOrderStatusInFirestore(id, targetStatus, { refundDetails: targetRefundDetails });
       } catch (dbErr: any) {
         console.error(`[Database Error] Refund status update failed in Firestore for Order #${id}:`, dbErr?.message || dbErr);
       }
 
-      // 2. Update in local store
+      // 3. Update in local store
       const store = getStore();
       store.orders = store.orders.map((o: any) => 
         o.id === id 
