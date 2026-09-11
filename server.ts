@@ -5,23 +5,23 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import fs from "fs";
-// Use require for node-fetch to avoid TypeScript type declaration issues in this project
-// (a proper fix would be to install @types/node-fetch or migrate to the global fetch in Node 18+)
-const fetch = require('node-fetch');
+import fetch from 'node-fetch';
 import admin from "firebase-admin";
 import { initializeApp, getApps, getApp } from "firebase/app";
-import { getFirestore, doc, setDoc as firestoreSetDoc } from "firebase/firestore";
+import { getAuth, signInAnonymously } from "firebase/auth";
+import { getFirestore, doc, setDoc as firestoreSetDoc, collection, getDocs } from "firebase/firestore";
 import nodemailer from "nodemailer";
 import { getStore, saveStore } from "./serverStore";
 
 // Create express app at module scope so it can be exported for serverless bundling
 const app = express();
 
-// Sync changes to Firestore's store/global document in the background.
-// Prefer using the Admin SDK when a service account is provided (recommended for production).
-async function syncToFirestore(data: Record<string, any>) {
+let serverFirestoreDb: any = null;
+let serverFirestoreAuth: any = null;
+
+async function getServerFirestore() {
+  if (serverFirestoreDb) return serverFirestoreDb;
   try {
-    // If a service account is provided via env, use firebase-admin for authoritative writes.
     const svcJson = process.env.FIREBASE_SERVICE_ACCOUNT;
     const hasGAC = !!process.env.GOOGLE_APPLICATION_CREDENTIALS;
 
@@ -32,33 +32,102 @@ async function syncToFirestore(data: Record<string, any>) {
             const svc = JSON.parse(svcJson as string);
             admin.initializeApp({ credential: admin.credential.cert(svc as any) });
           } else {
-            // If GOOGLE_APPLICATION_CREDENTIALS points to a file, admin will pick it up automatically
             admin.initializeApp();
           }
         }
-        const adb = admin.firestore();
-        await adb.doc("store/global").set(data, { merge: true });
-        return;
+        serverFirestoreDb = admin.firestore();
+        return serverFirestoreDb;
       } catch (adminErr: any) {
-        console.warn("Admin SDK sync failed, falling back to client SDK:", adminErr?.message || adminErr);
-        // fall through to client SDK fallback
+        console.warn("Admin SDK init notice, falling back to client SDK:", adminErr?.message || adminErr);
       }
     }
 
-    // Fallback: client SDK using firebase-applet-config.json (works for admin clients with proper apiKey)
     const configPath = path.join(process.cwd(), "firebase-applet-config.json");
-    if (!fs.existsSync(configPath)) return;
-    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    const fbApp = getApps().length === 0 ? initializeApp(config as any) : getApp();
-    const db = getFirestore(fbApp, config.firestoreDatabaseId || "(default)");
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      const fbApp = getApps().length === 0 ? initializeApp(config as any) : getApp();
+      serverFirestoreAuth = getAuth(fbApp);
+      await signInAnonymously(serverFirestoreAuth);
+      serverFirestoreDb = getFirestore(fbApp, config.firestoreDatabaseId || "(default)");
+      return serverFirestoreDb;
+    }
+  } catch (err: any) {
+    console.warn("Firestore server SDK initialization notice:", err?.message || err);
+  }
+  return null;
+}
+
+// Sync changes to Firestore's store/global document in the background.
+async function syncToFirestore(data: Record<string, any>) {
+  try {
+    const db = await getServerFirestore();
+    if (!db) return;
     await firestoreSetDoc(doc(db, "store", "global"), data, { merge: true });
   } catch (err: any) {
     console.warn("Backend syncToFirestore notice:", err?.message || err);
   }
 }
 
+// Persist single order directly into Firestore "orders" collection
+async function saveOrderToFirestore(order: any): Promise<boolean> {
+  try {
+    const db = await getServerFirestore();
+    if (!db) {
+      console.warn("[Database Notice] Firestore unavailable; relying on local store.");
+      return false;
+    }
+    const orderDocRef = doc(db, "orders", order.id);
+    await firestoreSetDoc(orderDocRef, {
+      ...order,
+      persistedAt: new Date().toISOString()
+    }, { merge: true });
+    console.log(`[Database Persistence] Successfully persisted Order #${order.id} to Firestore.`);
+    return true;
+  } catch (err: any) {
+    console.error(`[Database Error] Failed to persist Order #${order?.id} to Firestore:`, err?.message || err);
+    throw err;
+  }
+}
+
+// Retrieve all orders from Firestore "orders" collection
+async function getOrdersFromFirestore(): Promise<any[] | null> {
+  try {
+    const db = await getServerFirestore();
+    if (!db) return null;
+    const ordersCol = collection(db, "orders");
+    const snap = await getDocs(ordersCol);
+    const firestoreOrders: any[] = [];
+    snap.forEach((d) => {
+      firestoreOrders.push(d.data());
+    });
+    return firestoreOrders;
+  } catch (err: any) {
+    console.error("[Database Error] Failed to fetch orders from Firestore:", err?.message || err);
+    return null;
+  }
+}
+
+// Update order status in Firestore "orders" collection
+async function updateOrderStatusInFirestore(orderId: string, status: string, extraData: any = {}): Promise<boolean> {
+  try {
+    const db = await getServerFirestore();
+    if (!db) return false;
+    const orderDocRef = doc(db, "orders", orderId);
+    await firestoreSetDoc(orderDocRef, {
+      paymentStatus: status,
+      updatedAt: new Date().toISOString(),
+      ...extraData
+    }, { merge: true });
+    console.log(`[Database Persistence] Order #${orderId} status updated to '${status}' in Firestore.`);
+    return true;
+  } catch (err: any) {
+    console.error(`[Database Error] Failed to update status for Order #${orderId} in Firestore:`, err?.message || err);
+    throw err;
+  }
+}
+
 async function startServer() {
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ extended: true, limit: "50mb" }));
@@ -413,62 +482,142 @@ async function startServer() {
   });
 
   // Orders Endpoints
-  app.get("/api/orders", (req, res) => {
+  app.get("/api/orders", async (req, res) => {
     try {
       const store = getStore();
-      res.json(store.orders);
+      // Try to fetch from primary Firestore database
+      const firestoreOrders = await getOrdersFromFirestore();
+      if (firestoreOrders && firestoreOrders.length > 0) {
+        // Merge Firestore orders with store orders (deduplicating by id)
+        const orderMap = new Map<string, any>();
+        for (const o of store.orders || []) {
+          if (o && o.id) orderMap.set(o.id, o);
+        }
+        for (const o of firestoreOrders) {
+          if (o && o.id) orderMap.set(o.id, { ...orderMap.get(o.id), ...o });
+        }
+        const merged = Array.from(orderMap.values()).sort((a, b) => {
+          const timeA = new Date(a.createdAt || a.date || 0).getTime();
+          const timeB = new Date(b.createdAt || b.date || 0).getTime();
+          return timeB - timeA;
+        });
+        store.orders = merged;
+        saveStore(store);
+        return res.json(merged);
+      }
+      res.json(store.orders || []);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      console.error("[Database Error] Error fetching orders:", e?.message || e);
+      try {
+        const store = getStore();
+        res.json(store.orders || []);
+      } catch {
+        res.status(500).json({ error: e.message });
+      }
     }
   });
 
-  app.post("/api/orders", (req, res) => {
+  app.post("/api/orders", async (req, res) => {
     try {
       const order = req.body;
+      if (!order || !order.id) {
+        return res.status(400).json({ success: false, error: "Invalid order data: id is required" });
+      }
+
+      // 1. Immediately persist to primary database (Firestore) independent of email notifications
+      let firestoreSaved = false;
+      try {
+        firestoreSaved = await saveOrderToFirestore(order);
+      } catch (dbErr: any) {
+        console.error("[Database Error] Primary write error during order creation:", dbErr?.message || dbErr);
+      }
+
+      // 2. Also persist to local file store (serverStore) for reliability
       const store = getStore();
-      store.orders = [order, ...store.orders];
+      const existingIdx = store.orders.findIndex((o: any) => o.id === order.id);
+      if (existingIdx >= 0) {
+        store.orders[existingIdx] = order;
+      } else {
+        store.orders = [order, ...store.orders];
+      }
       saveStore(store);
-      res.json({ success: true, order, orders: store.orders });
+
+      console.log(`[Order Confirmation] Order #${order.id} persisted to database. Total: C$${order.total}. Customer: ${order.customerEmail}`);
+
+      res.json({
+        success: true,
+        order,
+        orders: store.orders,
+        databasePersisted: firestoreSaved
+      });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      console.error("[Database Error] Critical failure handling POST /api/orders:", e?.message || e);
+      res.status(500).json({ success: false, error: e.message });
     }
   });
 
-  app.put("/api/orders/:id/status", (req, res) => {
+  app.put("/api/orders/:id/status", async (req, res) => {
     try {
       const id = req.params.id;
       const { paymentStatus } = req.body;
+      if (!paymentStatus) {
+        return res.status(400).json({ success: false, error: "paymentStatus is required" });
+      }
+
+      // 1. Update in Firestore
+      try {
+        await updateOrderStatusInFirestore(id, paymentStatus);
+      } catch (dbErr: any) {
+        console.error(`[Database Error] Status update failed in Firestore for Order #${id}:`, dbErr?.message || dbErr);
+      }
+
+      // 2. Update in local store
       const store = getStore();
-      store.orders = store.orders.map(o => o.id === id ? { ...o, paymentStatus } : o);
+      store.orders = store.orders.map((o: any) => o.id === id ? { ...o, paymentStatus } : o);
       saveStore(store);
-      res.json({ success: true, orders: store.orders });
+
+      const updatedOrder = store.orders.find((o: any) => o.id === id);
+      console.log(`[Status Flow] Order #${id} status updated to '${paymentStatus}'`);
+      res.json({ success: true, order: updatedOrder, orders: store.orders });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      console.error("[Database Error] Failure updating order status:", e?.message || e);
+      res.status(500).json({ success: false, error: e.message });
     }
   });
 
-  app.post("/api/orders/:id/refund", (req, res) => {
+  app.post("/api/orders/:id/refund", async (req, res) => {
     try {
       const id = req.params.id;
       const { status, refundDetails } = req.body;
+      const targetStatus = status || "refund_processing";
+      const targetRefundDetails = refundDetails || {
+        requestedAt: new Date().toISOString(),
+        status: "processing"
+      };
+
+      // 1. Update in Firestore
+      try {
+        await updateOrderStatusInFirestore(id, targetStatus, { refundDetails: targetRefundDetails });
+      } catch (dbErr: any) {
+        console.error(`[Database Error] Refund status update failed in Firestore for Order #${id}:`, dbErr?.message || dbErr);
+      }
+
+      // 2. Update in local store
       const store = getStore();
-      store.orders = store.orders.map(o => 
+      store.orders = store.orders.map((o: any) => 
         o.id === id 
           ? { 
               ...o, 
-              paymentStatus: status || "refund_processing", 
-              refundDetails: refundDetails || {
-                requestedAt: new Date().toISOString(),
-                amount: o.total,
-                status: "processing"
-              } 
+              paymentStatus: targetStatus, 
+              refundDetails: { ...(o.refundDetails || {}), ...targetRefundDetails, amount: targetRefundDetails.amount || o.total } 
             } 
           : o
       );
       saveStore(store);
       res.json({ success: true, orders: store.orders });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      console.error("[Database Error] Failure updating order refund:", e?.message || e);
+      res.status(500).json({ success: false, error: e.message });
     }
   });
 
@@ -1268,14 +1417,14 @@ function formatCurrency(val: any): string {
     return res.json(rates);
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  // Vite middleware for development (only in local standalone Node.js environment)
+  if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (!process.env.VERCEL) {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -1283,12 +1432,12 @@ function formatCurrency(val: any): string {
     });
   }
 
-  if (process.env.NODE_ENV !== "production") {
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
-}
-
+  // In serverless environments (like Vercel), the platform routes HTTP requests directly without app.listen
+  if (!process.env.VERCEL && !process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  }
 }
 
 startServer();

@@ -572,7 +572,7 @@ export default function CheckoutProcess({ isOpen, onClose }: { isOpen: boolean, 
     }
   }, [isOpen]);
 
-  const handleSuccess = (etDetails?: { 
+  const handleSuccess = async (etDetails?: { 
     senderName: string; 
     senderBank: string; 
     senderEmail: string; 
@@ -657,57 +657,22 @@ export default function CheckoutProcess({ isOpen, onClose }: { isOpen: boolean, 
       } : {})
     };
 
-    // Save in Cart Context LocalStorage synchronizer
-    addOrder(newOrder);
-
-    // Immediately clear cart so cart is emptied upon payment confirmation
-    clearCart();
-
-    // Send Receipt Email
-    if (paymentMethod !== "etransfer") {
-      // Instant payments (PayPal / Card) send receipt immediately
-      sendReceiptEmail({
-        orderId: newOrderId,
-        date: dateStr,
-        createdAt: now.toISOString(),
-        timezone: userTz,
-        customerName: `${formData.firstName} ${formData.lastName}`,
-        customerEmail: formData.email,
-        address: formData.address,
-        city: formData.city,
-        province: province,
-        postal: formData.postal,
-        country: country === "CA" ? "Canada" : "United States",
-        items: orderItems,
-        subtotal: `C$${finalSubtotal.toFixed(2)}`,
-        shipping: `C$${finalShipping.toFixed(2)}`,
-        hst: `C$${finalHst.toFixed(2)}`,
-        total: `C$${finalTotal.toFixed(2)}`,
-        paymentMethod: "PayPal / Card",
-        shippingMethod: currentShippingMethod
-      }).catch(err => console.warn("Email sending notice:", err?.message || err));
-    } else {
-      // For Interac e-Transfer:
-      // DO NOT send customer receipt yet.
-      // Send notification email to admin showing the screenshot!
-      sendAdminInteracScreenshotNotification({
-        orderId: newOrderId,
-        total: `C$${finalTotal.toFixed(2)}`,
-        customerName: `${formData.firstName} ${formData.lastName}`,
-        customerEmail: formData.email,
-        date: dateStr,
-        deliveryAddress: `${formData.address}, ${formData.city}, ${province} ${formData.postal}, ${country === "CA" ? "Canada" : "United States"}`,
-        items: orderItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
-        etDetails: {
-          senderName: etDetails?.senderName || `${formData.firstName} ${formData.lastName}`,
-          senderBank: etDetails?.senderBank || "Canadian Bank",
-          senderEmail: etDetails?.senderEmail || formData.email,
-          referenceCode: etDetails?.referenceCode,
-          screenshot: etDetails?.screenshot
-        }
-      }).catch(err => console.warn("Admin notification notice:", err));
+    // 1. Immediately persist order payload to primary database
+    try {
+      const confirmResult = await addOrder(newOrder);
+      if (confirmResult?.success) {
+        console.log(`[Order Submission] Successfully confirmed database persistence for Order #${newOrderId}`);
+      } else {
+        console.warn(`[Order Submission Notice] Order persisted with warning:`, confirmResult?.error);
+      }
+    } catch (saveErr) {
+      console.error(`[Order Submission Error] Database persistence failure for Order #${newOrderId}:`, saveErr);
     }
 
+    // 2. Immediately clear cart so cart is emptied upon payment confirmation
+    clearCart();
+
+    // 3. Complete user checkout UI confirmation state
     setOrderInfo({ id: newOrderId, date: dateStr, timezone: userTz, createdAt: now.toISOString() });
     setStep("success");
     if (scrollContainerRef.current) {
@@ -718,6 +683,55 @@ export default function CheckoutProcess({ isOpen, onClose }: { isOpen: boolean, 
         ? (language === "en" ? "Interac screenshot submitted!" : "Capture d'écran Interac transmise !")
         : (language === "en" ? "Payment Successful! Order Confirmed." : "Paiement Réussi ! Commande Confirmée.")
     );
+
+    // 4. Send Receipt Email (independent of database persistence)
+    try {
+      if (paymentMethod !== "etransfer") {
+        // Instant payments (PayPal / Card) send receipt immediately
+        sendReceiptEmail({
+          orderId: newOrderId,
+          date: dateStr,
+          createdAt: now.toISOString(),
+          timezone: userTz,
+          customerName: `${formData.firstName} ${formData.lastName}`,
+          customerEmail: formData.email,
+          address: formData.address,
+          city: formData.city,
+          province: province,
+          postal: formData.postal,
+          country: country === "CA" ? "Canada" : "United States",
+          items: orderItems,
+          subtotal: `C$${finalSubtotal.toFixed(2)}`,
+          shipping: `C$${finalShipping.toFixed(2)}`,
+          hst: `C$${finalHst.toFixed(2)}`,
+          total: `C$${finalTotal.toFixed(2)}`,
+          paymentMethod: "PayPal / Card",
+          shippingMethod: currentShippingMethod
+        }).catch(err => console.warn("Email sending notice:", err?.message || err));
+      } else {
+        // For Interac e-Transfer:
+        // DO NOT send customer receipt yet.
+        // Send notification email to admin showing the screenshot!
+        sendAdminInteracScreenshotNotification({
+          orderId: newOrderId,
+          total: `C$${finalTotal.toFixed(2)}`,
+          customerName: `${formData.firstName} ${formData.lastName}`,
+          customerEmail: formData.email,
+          date: dateStr,
+          deliveryAddress: `${formData.address}, ${formData.city}, ${province} ${formData.postal}, ${country === "CA" ? "Canada" : "United States"}`,
+          items: orderItems.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
+          etDetails: {
+            senderName: etDetails?.senderName || `${formData.firstName} ${formData.lastName}`,
+            senderBank: etDetails?.senderBank || "Canadian Bank",
+            senderEmail: etDetails?.senderEmail || formData.email,
+            referenceCode: etDetails?.referenceCode,
+            screenshot: etDetails?.screenshot
+          }
+        }).catch(err => console.warn("Admin notification notice:", err));
+      }
+    } catch (emailErr) {
+      console.warn("Email notification dispatch notice:", emailErr);
+    }
   };
 
   const handleFinish = () => {

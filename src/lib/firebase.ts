@@ -1,33 +1,36 @@
-// Minimal firebase-like stub used when Firebase isn't configured locally.
-// This prevents build-time errors from imports like `../lib/firebase`
-// while the app can still run without realtime Firestore subscriptions.
-
-export const db: any = null;
-
-export const auth: any = null;
-
-export const doc = (..._args: any[]) => {
-  // Return a simple reference object placeholder
-  return { __stub: true };
-};
-
-export const onSnapshot = (
-  _ref: any,
-  _next?: (snap: any) => void,
-  _error?: (err: any) => void
-) => {
-  // No-op: return an unsubscribe function
-  return () => {};
-};
-
-export const setDoc = async (_ref: any, _data: any, _options?: any) => {
-  // No-op promise to mimic Firebase setDoc
-  return Promise.resolve();
-};
-
-export default {
-  db,
+import { initializeApp, getApps, getApp } from "firebase/app";
+import { getAuth, signInAnonymously } from "firebase/auth";
+import {
+  getFirestore,
+  collection,
   doc,
   onSnapshot,
   setDoc,
+  updateDoc,
+  getDocs,
+  query,
+  orderBy
+} from "firebase/firestore";
+
+const firebaseConfig = {
+  projectId: "vonn-essentials-f5076",
+  appId: "1:881735947174:web:beef7bad44a1815decf567",
+  apiKey: "AIzaSyBhDILGpMnmrOwiXXTohosq5liq-HtOmHM",
+  authDomain: "vonn-essentials-f5076.firebaseapp.com",
+  firestoreDatabaseId: "vonn-essentials"
 };
+
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+export const auth = getAuth(app);
+export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId || "(default)");
+
+// Automatically authenticate anonymously for authorized Firestore database access
+if (typeof window !== "undefined") {
+  signInAnonymously(auth).catch((err) => {
+    console.warn("Client Firebase anonymous authentication notice:", err?.message || err);
+  });
+}
+
+export { collection, doc, onSnapshot, setDoc, updateDoc, getDocs, query, orderBy };
+export default { db, auth, doc, collection, onSnapshot, setDoc, updateDoc, getDocs, query, orderBy };
+

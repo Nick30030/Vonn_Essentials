@@ -63,6 +63,7 @@ export interface StoreData {
   newsletters: any[];
   giftCodes: GiftCode[];
   orders: any[];
+  adminNotifications?: any[];
 }
 
 const DEFAULT_PRODUCTS_EN: Product[] = [
@@ -468,40 +469,69 @@ const DATA_DIR = process.env.VERCEL
   : path.join(process.cwd(), "data");
 const DATA_FILE = path.join(DATA_DIR, "store.json");
 
+function getDefaultStoreData(): StoreData {
+  return {
+    productsEn: DEFAULT_PRODUCTS_EN,
+    productsFr: DEFAULT_PRODUCTS_FR,
+    blogsEn: DEFAULT_BLOG_EN,
+    blogsFr: DEFAULT_BLOG_FR,
+    shippingEn: DEFAULT_SHIPPING_EN,
+    shippingFr: DEFAULT_SHIPPING_FR,
+    aboutEn: DEFAULT_ABOUT_EN,
+    aboutFr: DEFAULT_ABOUT_FR,
+    announcement: {
+      textEn: "🌿 Summer Sale: Free shipping on orders over C$35 across Canada!",
+      textFr: "🌿 Solde d'été : Livraison gratuite sur commandes de plus de 35$ au Canada !",
+      isActive: true
+    },
+    newsletters: DEFAULT_NEWSLETTERS,
+    giftCodes: DEFAULT_GIFT_CODES,
+    orders: DEFAULT_ORDERS,
+    adminNotifications: []
+  };
+}
+
 function ensureStoreFile(): StoreData {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-
-  if (!fs.existsSync(DATA_FILE)) {
-    const initialData: StoreData = {
-      productsEn: DEFAULT_PRODUCTS_EN,
-      productsFr: DEFAULT_PRODUCTS_FR,
-      blogsEn: DEFAULT_BLOG_EN,
-      blogsFr: DEFAULT_BLOG_FR,
-      shippingEn: DEFAULT_SHIPPING_EN,
-      shippingFr: DEFAULT_SHIPPING_FR,
-      aboutEn: DEFAULT_ABOUT_EN,
-      aboutFr: DEFAULT_ABOUT_FR,
-      announcement: {
-        textEn: "🌿 Summer Sale: Free shipping on orders over C$35 across Canada!",
-        textFr: "🌿 Solde d'été : Livraison gratuite sur commandes de plus de 35$ au Canada !",
-        isActive: true
-      },
-      newsletters: DEFAULT_NEWSLETTERS,
-      giftCodes: DEFAULT_GIFT_CODES,
-      orders: DEFAULT_ORDERS
-    };
-    fs.writeFileSync(DATA_FILE, JSON.stringify(initialData, null, 2), "utf8");
-    return initialData;
-  }
-
   try {
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    const data = JSON.parse(raw);
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+
+    let raw = "";
+    if (fs.existsSync(DATA_FILE)) {
+      try {
+        raw = fs.readFileSync(DATA_FILE, "utf8");
+      } catch (readErr) {
+        console.warn("Notice reading store.json:", readErr);
+      }
+    }
+
+    // If file does not exist, is 0 bytes, or only whitespace, initialize and write healthy defaults
+    if (!raw || raw.trim().length === 0) {
+      const initialData = getDefaultStoreData();
+      saveStore(initialData);
+      return initialData;
+    }
+
+    let data: any;
+    try {
+      data = JSON.parse(raw);
+    } catch (parseErr) {
+      console.warn("store.json was empty or corrupted, automatically restoring healthy defaults:", parseErr);
+      const restoredData = getDefaultStoreData();
+      saveStore(restoredData);
+      return restoredData;
+    }
+
+    if (!data || typeof data !== "object") {
+      const restoredData = getDefaultStoreData();
+      saveStore(restoredData);
+      return restoredData;
+    }
+
     return {
-      productsEn: data.productsEn || DEFAULT_PRODUCTS_EN,
-      productsFr: data.productsFr || DEFAULT_PRODUCTS_FR,
+      productsEn: Array.isArray(data.productsEn) && data.productsEn.length > 0 ? data.productsEn : DEFAULT_PRODUCTS_EN,
+      productsFr: Array.isArray(data.productsFr) && data.productsFr.length > 0 ? data.productsFr : DEFAULT_PRODUCTS_FR,
       blogsEn: data.blogsEn || DEFAULT_BLOG_EN,
       blogsFr: data.blogsFr || DEFAULT_BLOG_FR,
       shippingEn: data.shippingEn || DEFAULT_SHIPPING_EN,
@@ -518,28 +548,12 @@ function ensureStoreFile(): StoreData {
       },
       newsletters: data.newsletters || DEFAULT_NEWSLETTERS,
       giftCodes: data.giftCodes || DEFAULT_GIFT_CODES,
-      orders: data.orders || DEFAULT_ORDERS
+      orders: data.orders || DEFAULT_ORDERS,
+      adminNotifications: data.adminNotifications || []
     };
   } catch (e) {
-    console.error("Error reading store.json, returning defaults", e);
-    return {
-      productsEn: DEFAULT_PRODUCTS_EN,
-      productsFr: DEFAULT_PRODUCTS_FR,
-      blogsEn: DEFAULT_BLOG_EN,
-      blogsFr: DEFAULT_BLOG_FR,
-      shippingEn: DEFAULT_SHIPPING_EN,
-      shippingFr: DEFAULT_SHIPPING_FR,
-      aboutEn: DEFAULT_ABOUT_EN,
-      aboutFr: DEFAULT_ABOUT_FR,
-      announcement: {
-        textEn: "🌿 Summer Sale: Free shipping on orders over C$35 across Canada!",
-        textFr: "🌿 Solde d'été : Livraison gratuite sur commandes de plus de 35$ au Canada !",
-        isActive: true
-      },
-      newsletters: DEFAULT_NEWSLETTERS,
-      giftCodes: DEFAULT_GIFT_CODES,
-      orders: DEFAULT_ORDERS
-    };
+    console.warn("Unexpected store file error, returning defaults:", e);
+    return getDefaultStoreData();
   }
 }
 
@@ -552,8 +566,20 @@ export function saveStore(data: StoreData): void {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+    const jsonStr = JSON.stringify(data, null, 2);
+    // Write atomically via temporary file and rename to prevent 0-byte or partial files
+    const tempFile = path.join(
+      DATA_DIR,
+      `.store.json.tmp.${Date.now()}.${Math.random().toString(36).substring(2, 8)}`
+    );
+    fs.writeFileSync(tempFile, jsonStr, "utf8");
+    fs.renameSync(tempFile, DATA_FILE);
   } catch (error) {
-    console.error("Failed to write store.json", error);
+    console.warn("Failed to write store.json atomically, falling back to direct write:", error);
+    try {
+      fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+    } catch (fallbackErr) {
+      console.error("Failed direct write fallback for store.json:", fallbackErr);
+    }
   }
 }

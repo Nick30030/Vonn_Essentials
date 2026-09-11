@@ -40,8 +40,10 @@
   "migrate:pg": "node scripts/migrate-to-postgres.js",
   "devDependencies": {
     "@types/express": "^4.17.21",
+    "@types/glob": "^9.0.0",
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
+    "esbuild": "^0.28.2",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",

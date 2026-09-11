@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { CartItem, Product, Order } from '../types';
-import { db, doc, onSnapshot, setDoc } from '../lib/firebase';
+import { db, doc, collection, onSnapshot, setDoc, updateDoc } from '../lib/firebase';
 import { supabase } from '../lib/supabase';
 
 interface CartContextType {
@@ -27,12 +27,12 @@ interface CartContextType {
   selectedRate: any | null;
   setSelectedRate: (rate: any | null) => void;
   orders: Order[];
-  addOrder: (order: Order) => void;
-  updateOrderStatus: (orderId: string, status: Order["paymentStatus"]) => void;
+  addOrder: (order: Order) => Promise<{ success: boolean; order?: Order; error?: string }>;
+  updateOrderStatus: (orderId: string, status: Order["paymentStatus"]) => Promise<void>;
   updateOrderRefund: (orderId: string, refundData: {
     status: Order["paymentStatus"];
     refundDetails: NonNullable<Order["refundDetails"]>;
-  }) => void;
+  }) => Promise<void>;
   refetchOrders: () => Promise<void>;
 }
 
@@ -136,12 +136,40 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     await fetchOrders();
   };
 
-  // Synchronize orders with Firestore / Supabase real-time database and server API
+  // Synchronize orders with Firestore real-time database, Supabase, and server API
   useEffect(() => {
-    let unsubscribe = () => {};
+    let unsubscribeFirestore = () => {};
 
+    try {
+      if (db) {
+        const ordersCol = collection(db, "orders");
+        unsubscribeFirestore = onSnapshot(ordersCol, (snapshot) => {
+          if (!snapshot.empty) {
+            const liveOrders: Order[] = [];
+            snapshot.forEach((docSnap) => {
+              const data = docSnap.data();
+              if (data && data.id) {
+                liveOrders.push(data as Order);
+              }
+            });
+            liveOrders.sort((a, b) => {
+              const timeA = new Date(a.createdAt || a.date || 0).getTime();
+              const timeB = new Date(b.createdAt || b.date || 0).getTime();
+              return timeB - timeA;
+            });
+            setOrders(liveOrders);
+            localStorage.setItem("vonn_orders", JSON.stringify(liveOrders));
+          }
+        }, (err) => {
+          console.warn("Firestore live orders subscription notice:", err?.message || err);
+        });
+      }
+    } catch (e) {
+      console.warn("Firestore real-time listener init notice:", e);
+    }
+
+    let unsubscribeSupabase = () => {};
     if (supabase) {
-      // Subscribe to Postgres changes on the `orders` table and refresh orders via the API
       const channel = supabase
         .channel('public:orders')
         .on(
@@ -153,7 +181,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         )
         .subscribe();
 
-      unsubscribe = () => {
+      unsubscribeSupabase = () => {
         try {
           channel.unsubscribe();
         } catch (e) {
@@ -163,7 +191,10 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     void fetchOrders();
-    return () => unsubscribe();
+    return () => {
+      unsubscribeFirestore();
+      unsubscribeSupabase();
+    };
   }, []);
 
   useEffect(() => {
@@ -174,51 +205,117 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.setItem("vonn_orders", JSON.stringify(orders));
   }, [orders]);
 
-  const addOrder = (order: Order) => {
+  const addOrder = async (order: Order): Promise<{ success: boolean; order?: Order; error?: string }> => {
+    // 1. Optimistically update local state & cache
     setOrders((prev) => {
-      const updated = [order, ...prev];
-      // Persist to Supabase asynchronously (best-effort)
-      (async () => {
-        if (supabase) {
-          try {
-            await supabase.from('orders').insert([order]);
-          } catch (e) {
-            console.warn('Supabase insert orders error (suppressed):', e);
-          }
-        }
-      })();
+      const updated = [order, ...prev.filter(o => o.id !== order.id)];
+      localStorage.setItem("vonn_orders", JSON.stringify(updated));
       return updated;
     });
-    fetch("/api/orders", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(order)
-    }).catch(() => {});
+
+    // 2. Direct client Firestore write (best-effort redundancy)
+    try {
+      if (db) {
+        await setDoc(doc(db, "orders", order.id), order, { merge: true });
+        console.log(`[Order Confirmation] Client Firestore write verified for Order #${order.id}`);
+      }
+    } catch (fsErr: any) {
+      console.warn("Direct client Firestore write notice (will rely on server persistence):", fsErr?.message || fsErr);
+    }
+
+    // 3. Supabase write if configured
+    if (supabase) {
+      try {
+        await supabase.from('orders').insert([order]);
+      } catch (e) {
+        console.warn('Supabase insert orders notice:', e);
+      }
+    }
+
+    // 4. Primary backend database write via API
+    try {
+      const res = await fetch("/api/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(order)
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error(`[Database Persistence Error] Server responded with error ${res.status}:`, errText);
+        return { success: false, error: `Database persistence responded with HTTP ${res.status}` };
+      }
+
+      const data = await res.json();
+      if (data.success) {
+        console.log(`[Order Confirmation] Server successfully stored Order #${order.id} in primary database.`);
+        if (Array.isArray(data.orders)) {
+          setOrders(data.orders);
+          localStorage.setItem("vonn_orders", JSON.stringify(data.orders));
+        }
+        return { success: true, order: data.order || order };
+      } else {
+        console.error("[Database Persistence Error] Order store returned false success:", data.error);
+        return { success: false, error: data.error || "Failed to persist order" };
+      }
+    } catch (err: any) {
+      console.error("[Database Persistence Error] Network error during order persistence:", err?.message || err);
+      // Even if network fails, the local state and client attempt were made
+      return { success: false, error: err?.message || "Network error" };
+    }
   };
 
-  const updateOrderStatus = (orderId: string, status: Order["paymentStatus"]) => {
+  const updateOrderStatus = async (orderId: string, status: Order["paymentStatus"]) => {
+    // 1. Optimistic state update
     setOrders((prev) => {
       const updated = prev.map(o => o.id === orderId ? { ...o, paymentStatus: status } : o);
-      // Persist change to Supabase (best-effort)
-      (async () => {
-        if (supabase) {
-          try {
-            await supabase.from('orders').update({ paymentStatus: status }).eq('id', orderId);
-          } catch (e) {
-            console.warn('Supabase update orders error (suppressed):', e);
-          }
-        }
-      })();
+      localStorage.setItem("vonn_orders", JSON.stringify(updated));
       return updated;
     });
-    fetch(`/api/orders/${encodeURIComponent(orderId)}/status`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paymentStatus: status })
-    }).catch(() => {});
+
+    // 2. Direct client Firestore write
+    try {
+      if (db) {
+        await updateDoc(doc(db, "orders", orderId), {
+          paymentStatus: status,
+          updatedAt: new Date().toISOString()
+        });
+      }
+    } catch (e) {
+      console.warn("Client Firestore status update notice:", e);
+    }
+
+    // 3. Supabase write if configured
+    if (supabase) {
+      try {
+        await supabase.from('orders').update({ paymentStatus: status }).eq('id', orderId);
+      } catch (e) {
+        console.warn('Supabase update orders notice:', e);
+      }
+    }
+
+    // 4. Server API update
+    try {
+      const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/status`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paymentStatus: status })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.orders) {
+          setOrders(data.orders);
+          localStorage.setItem("vonn_orders", JSON.stringify(data.orders));
+        }
+      } else {
+        console.error(`[Database Error] Status update failed on server: ${res.status}`);
+      }
+    } catch (err) {
+      console.error("[Database Error] Network error during status update:", err);
+    }
   };
 
-  const updateOrderRefund = (
+  const updateOrderRefund = async (
     orderId: string,
     refundData: {
       status: Order["paymentStatus"];
@@ -235,23 +332,34 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
             }
           : o
       );
-      // Persist refund update to Supabase (best-effort)
-      (async () => {
-        if (supabase) {
-          try {
-            await supabase.from('orders').update({ paymentStatus: refundData.status, refundDetails: refundData.refundDetails }).eq('id', orderId);
-          } catch (e) {
-            console.warn('Supabase refund update error (suppressed):', e);
-          }
-        }
-      })();
+      localStorage.setItem("vonn_orders", JSON.stringify(updated));
       return updated;
     });
-    fetch(`/api/orders/${encodeURIComponent(orderId)}/refund`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(refundData),
-    }).catch(() => {});
+
+    if (supabase) {
+      try {
+        await supabase.from('orders').update({ paymentStatus: refundData.status, refundDetails: refundData.refundDetails }).eq('id', orderId);
+      } catch (e) {
+        console.warn('Supabase refund update error (suppressed):', e);
+      }
+    }
+
+    try {
+      const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/refund`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(refundData),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.orders) {
+          setOrders(data.orders);
+          localStorage.setItem("vonn_orders", JSON.stringify(data.orders));
+        }
+      }
+    } catch (err) {
+      console.error("[Database Error] Network error during refund update:", err);
+    }
   };
 
   const addToCart = (product: Product) => {

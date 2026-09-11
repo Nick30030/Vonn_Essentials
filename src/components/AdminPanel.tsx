@@ -610,6 +610,7 @@ export default function AdminPanel({ isOpen, onClose }: AdminPanelProps) {
                   updateStatus={updateOrderStatus} 
                   updateOrderRefund={updateOrderRefund}
                   showConfirm={showConfirm}
+                  onRefresh={refetchOrders}
                 />
               ) : adminView === "journal" ? (
                 <AdminJournalView language={language} showConfirm={showConfirm} />
@@ -1244,18 +1245,36 @@ function AdminOrdersView({
   setFilter,
   updateStatus,
   updateOrderRefund,
-  showConfirm
+  showConfirm,
+  onRefresh
 }: {
   orders: Order[];
   language: string;
   filter: string;
   setFilter: (f: any) => void;
-  updateStatus: (id: string, s: any) => void;
-  updateOrderRefund: (id: string, data: { status: Order["paymentStatus"]; refundDetails: NonNullable<Order["refundDetails"]> }) => void;
+  updateStatus: (id: string, s: any) => void | Promise<void>;
+  updateOrderRefund: (id: string, data: { status: Order["paymentStatus"]; refundDetails: NonNullable<Order["refundDetails"]> }) => void | Promise<void>;
   showConfirm: (title: string, message: string, onConfirm: () => void) => void;
+  onRefresh?: () => Promise<void>;
 }) {
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
   const [selectedScreenshot, setSelectedScreenshot] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+
+  const handleManualRefresh = async () => {
+    if (onRefresh) {
+      setIsRefreshing(true);
+      try {
+        await onRefresh();
+        toast.success(language === "en" ? "Orders synchronized with database" : "Commandes synchronisées avec la base de données");
+      } catch (err: any) {
+        console.error("Refresh orders error:", err);
+        toast.error("Failed to refresh orders");
+      } finally {
+        setIsRefreshing(false);
+      }
+    }
+  };
   
   // Refund Modal State
   const [refundModalOrder, setRefundModalOrder] = useState<Order | null>(null);
@@ -1439,7 +1458,33 @@ function AdminOrdersView({
 
   return (
     <div className="space-y-6">
-      {/* Mini Stats Grid */}
+      {/* Mini Stats Grid & Live Sync Toolbar */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 font-sans">
+        <div className="flex items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-full text-[10px] font-bold uppercase tracking-wider shadow-sm">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            {language === "en" ? "Live Database Connected" : "Base de données connectée"}
+          </span>
+          <span className="text-gray-400 text-xs font-mono">•</span>
+          <span className="text-gray-500 text-xs font-mono">{orders.length} {language === "en" ? "total records" : "commandes"}</span>
+        </div>
+
+        {onRefresh && (
+          <button
+            type="button"
+            onClick={handleManualRefresh}
+            disabled={isRefreshing}
+            className="px-3.5 py-1.5 bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 rounded-xl text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 shadow-sm disabled:opacity-60 self-start sm:self-auto cursor-pointer"
+            title="Synchronize orders with primary database"
+          >
+            <RefreshCw size={12} className={isRefreshing ? "animate-spin text-brand-accent" : "text-gray-500"} />
+            {isRefreshing 
+              ? (language === "en" ? "Syncing..." : "Synchronisation...") 
+              : (language === "en" ? "Sync with DB" : "Actualiser BD")}
+          </button>
+        )}
+      </div>
+
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 font-sans text-left">
         <div className="p-5 bg-gray-50/50 rounded-2xl border border-gray-100">
           <p className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Total Sales (CAD)</p>
@@ -2028,7 +2073,7 @@ function AdminOrdersView({
                                 }
                               );
                             }}
-                            className="px-4 py-2 border border-red-200 hover:bg-red-50 text-red-600 rounded-xl text-[10px] font-bold uppercase tracking-wider transition-colors"
+                            className="px-4 py-2 border border-red-200 hover:bg-red-50 text-red-600 rounded-xl text-[10px] font-bold uppercase tracking-wider transition-colors cursor-pointer"
                           >
                             Cancel
                           </button>

@@ -34,7 +34,7 @@ export interface Order {
   hst: number;
   total: number;
   paymentMethod: "paypal" | "etransfer";
-  paymentStatus: "pending_etransfer" | "completed" | "cancelled" | "refund_processing" | "refunded";
+  paymentStatus: "pending_etransfer" | "completed" | "cancelled" | "refund_processing" | "refunded" | "pending" | "approved" | "rejected";
   shippingMethod: string;
   orderComments?: string;
   discountCode?: string;
