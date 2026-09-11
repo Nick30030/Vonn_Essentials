@@ -1,0 +1,8 @@
+{
+  "name": "Vonn_Essentials",
+  "description": "Handcrafted skincare products infused with natural essential oils. Reimagined with fluid animations and organic design.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
